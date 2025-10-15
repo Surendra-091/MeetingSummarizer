@@ -1,8 +1,8 @@
 # main.py
 import os
-import re
-import json
 import uuid
+import json
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -11,58 +11,46 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+import whisper
+import google.generativeai as genai
+
 # ----------------------------
-# Load environment
+# Load environment variables
 # ----------------------------
 load_dotenv()
-
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY not set in .env or environment variables.")
+    raise RuntimeError("GOOGLE_API_KEY not set in .env")
 
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "small")
-ASR_BACKEND = os.getenv("ASR_BACKEND", "whisper")
+genai.configure(api_key=GOOGLE_API_KEY)
 
+# ----------------------------
+# Whisper model
+# ----------------------------
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "tiny")
+WHISPER_MODEL = whisper.load_model(WHISPER_MODEL_SIZE)
+
+# ----------------------------
+# Data storage
+# ----------------------------
 DATA_DIR = Path(__file__).parent / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
+STORE = {}
 
-# ----------------------------
-# Helpers
-# ----------------------------
 def gen_id() -> str:
     return uuid.uuid4().hex
 
-def save_upload_file(upload_file: UploadFile, destination: Path) -> None:
+def save_upload_file(upload_file: UploadFile, destination: Path):
     with destination.open("wb") as f:
         f.write(upload_file.file.read())
-
-# ----------------------------
-# Whisper local transcription
-# ----------------------------
-if ASR_BACKEND == "whisper":
-    try:
-        import whisper
-        WHISPER_MODEL = whisper.load_model(WHISPER_MODEL_SIZE)
-    except Exception as e:
-        WHISPER_MODEL = None
-        print("Warning: could not load whisper model:", e)
-
-    def transcribe_audio_local(file_path: str) -> str:
-        if WHISPER_MODEL is None:
-            raise RuntimeError("Whisper model not loaded. Install whisper and ffmpeg.")
-        result = WHISPER_MODEL.transcribe(file_path)
-        text = result.get("text", "") if isinstance(result, dict) else getattr(result, "text", "")
-        return (text or "").strip()
-else:
-    raise RuntimeError("Unsupported ASR_BACKEND: " + ASR_BACKEND)
 
 # ----------------------------
 # Pydantic models
 # ----------------------------
 class ActionItem(BaseModel):
-    text: str
-    owner: Optional[str] = None
-    due: Optional[str] = None
+    task: str
+    assigned_to: Optional[str] = None
+    deadline: Optional[str] = None
 
 class MeetingResult(BaseModel):
     id: str
@@ -75,7 +63,7 @@ class MeetingResult(BaseModel):
 # ----------------------------
 # FastAPI app
 # ----------------------------
-app = FastAPI(title="Meeting Summarizer - Local Whisper + Google AI Studio")
+app = FastAPI(title="Meeting Summarizer - Whisper + Gemini AI")
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,65 +72,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Simple in-memory store
-STORE = {}
-
 # ----------------------------
-# Google Generative AI setup
+# AI functions
 # ----------------------------
-import google.generativeai as genai
-genai.configure(api_key=GOOGLE_API_KEY)
+MODEL_GEN = genai.GenerativeModel("gemini-2.5-pro")
 
-def summarize_transcript_with_google(transcript: str) -> dict:
-    prompt = f"""
-You are an assistant that reads medical consultation transcripts.
-Analyze the transcript carefully and extract:
+def transcribe_audio(file_path: str) -> str:
+    result = WHISPER_MODEL.transcribe(file_path)
+    return result.get("text", "").strip()
 
-1) A concise summary (2-4 sentences) of the consultation.
-2) All decisions made by the doctor or medical staff, even implied ones.
-3) Action items for patient, parent, or medical staff, clearly stating:
-   - task description
-   - who should do it (owner)
-   - deadline or timing if mentioned
+def summarize_and_extract(transcript: str) -> dict:
+    # 1️⃣ Summary
+    summary_prompt = f"""
+You are an AI meeting assistant.
+Summarize the following meeting transcript into a concise, clear summary:
+{transcript}
+"""
+    summary_resp = MODEL_GEN.generate_content(summary_prompt)
+    summary_text = summary_resp.text
 
-Return **ONLY valid JSON** in this exact format:
+    # 2️⃣ Extract Decisions & Action Items
+    analysis_prompt = f"""
+You are an AI meeting assistant.
+Analyze the following meeting transcript and extract:
+
+1) Key Decisions – list of decisions finalized.
+2) Action Items – list of actionable tasks with responsible persons and deadlines if mentioned.
+
+Return JSON only with this format:
 {{
-  "summary": "string",
-  "decisions": ["list of decisions, if any, otherwise empty"],
+  "decisions": ["..."],
   "action_items": [
-      {{
-          "text": "task description",
-          "owner": "who should do it (optional)",
-          "due": "deadline or timing (optional)"
-      }}
+    {{"task": "...", "assigned_to": "...", "deadline": "..."}}
   ]
 }}
 
 Transcript:
 {transcript}
 """
+    analysis_resp = MODEL_GEN.generate_content(analysis_prompt)
+    output_text = analysis_resp.text
+
+    # Clean Markdown JSON if present
+    clean_output = re.sub(r"^```json\s*|```$", "", output_text, flags=re.MULTILINE).strip()
     try:
-        response = genai.models.TextGeneration.create(
-            model="chat-bison-001",
-            prompt=prompt,
-            temperature=0
-        )
-        # New API returns result_text
-        content = getattr(response, "text", "") or ""
-        # Attempt strict JSON parsing
-        m = re.search(r"(\{.*\})", content, flags=re.S)
-        json_text = m.group(1) if m else content
-        parsed = json.loads(json_text)
-        parsed.setdefault("summary", "")
-        parsed.setdefault("decisions", [])
-        parsed.setdefault("action_items", [])
-        return parsed
-    except Exception as e:
-        print("Google AI summarization failed:", e)
-        return {"summary": transcript[:400] + "...", "decisions": [], "action_items": []}
+        parsed = json.loads(clean_output)
+    except json.JSONDecodeError:
+        parsed = {"decisions": [], "action_items": []}
+
+    return {
+        "summary": summary_text,
+        "decisions": parsed.get("decisions", []),
+        "action_items": parsed.get("action_items", [])
+    }
 
 # ----------------------------
-# Upload endpoint
+# Endpoints
 # ----------------------------
 @app.post("/upload", response_model=MeetingResult)
 async def upload_meeting(file: UploadFile = File(...)):
@@ -156,46 +141,51 @@ async def upload_meeting(file: UploadFile = File(...)):
     try:
         save_upload_file(file, dest)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save upload: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
     try:
-        transcript = transcribe_audio_local(str(dest))
+        transcript = transcribe_audio(str(dest))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Transcription error: {e}")
 
-    parsed = summarize_transcript_with_google(transcript)
+    try:
+        parsed = summarize_and_extract(transcript)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Summarization error: {e}")
 
-    decisions = parsed.get("decisions") or []
-    action_items_raw = parsed.get("action_items") or []
+    # Convert action items to Pydantic model
     action_items = []
-    for ai in action_items_raw:
+    for ai in parsed.get("action_items", []):
         if isinstance(ai, dict):
             action_items.append(ActionItem(
-                text=ai.get("text",""),
-                owner=ai.get("owner"),
-                due=ai.get("due")
+                task=ai.get("task", ""),
+                assigned_to=ai.get("assigned_to"),
+                deadline=ai.get("deadline")
             ))
         else:
-            action_items.append(ActionItem(text=str(ai)))
+            action_items.append(ActionItem(task=str(ai)))
 
     result = MeetingResult(
         id=mid,
         filename=filename,
         transcript=transcript,
         summary=parsed.get("summary", "")[:2000],
-        decisions=decisions,
+        decisions=parsed.get("decisions", []),
         action_items=action_items
     )
 
     STORE[mid] = result
     return result
 
-# ----------------------------
-# Get transcript endpoint
-# ----------------------------
 @app.get("/transcript/{mid}", response_model=MeetingResult)
-async def get_result(mid: str):
+async def get_transcript(mid: str):
     if mid not in STORE:
         raise HTTPException(status_code=404, detail="Not found")
     return STORE[mid]
 
+# ----------------------------
+# Run
+# ----------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
